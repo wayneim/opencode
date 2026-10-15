@@ -486,7 +486,8 @@ const layer = Layer.effect(
             }
             yield* sessions.updatePart(userPart)
 
-            const msg: SessionV1.Assistant = {
+// 为本轮新建一条空的 assistant 消息落库，作为 LLM 输出的容器
+          const msg: SessionV1.Assistant = {
               id: MessageID.ascending(),
               sessionID: input.sessionID,
               parentID: userMsg.id,
@@ -1085,10 +1086,15 @@ const layer = Layer.effect(
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
+        // 主循环不变式：每轮迭代前重载历史，依据最后一条 assistant 消息的
+        // 完成状态决定是否还能退出。同一 session 同一时刻只有一个 run，
+        // 由外层 state.ensureRunning 保证串行。
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
+          // 重载历史消息（已滤掉 compaction 合成的旧消息），并提取最新
+          // user/assistant 消息、finish 状态与待处理任务（subtask/compaction）。
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
@@ -1108,6 +1114,9 @@ const layer = Layer.effect(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
 
+          // 退出条件：assistant 已 finish（不是 tool-calls，且没有尚未执行的
+          // tool part），且最后一条 assistant 晚于最后一条 user（这次循环已产出过回答）。
+          // 注意 hasToolCalls 会忽略 cleanup 标记的中断孤儿 tool，避免它们阻塞退出。
           if (
             lastAssistant?.finish &&
             !["tool-calls"].includes(lastAssistant.finish) &&
@@ -1130,6 +1139,7 @@ const layer = Layer.effect(
           }
 
           step++
+          // 第 1 步时后台并行生成会话标题与摘要，不阻塞主循环
           if (step === 1)
             yield* title({
               session,
@@ -1141,6 +1151,8 @@ const layer = Layer.effect(
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
           const task = tasks.pop()
 
+          // 优先处理 pending 的任务：subtask（递归执行子任务）或
+          // compaction（压缩历史后，若需 stop 则退出，否则继续下一轮）。
           if (task?.type === "subtask") {
             yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
             continue
@@ -1158,6 +1170,8 @@ const layer = Layer.effect(
             continue
           }
 
+          // 溢出触发：历史 tokens 超限且非 summary 消息 → 创建自动压缩任务，
+          // 本轮不跑模型，直接 continue 让下一轮先压缩。
           if (
             lastFinished &&
             lastFinished.summary !== true &&
@@ -1177,6 +1191,7 @@ const layer = Layer.effect(
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = step >= maxSteps
+          // 注入 agents 提醒/记忆到历史，之后走正常模型回合
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
@@ -1210,6 +1225,7 @@ const layer = Layer.effect(
             yield* sessions.updateMessage(msg)
           })
 
+          // 中断兜底：循环被中断时把未完成消息标记为 aborted
           const handle = yield* processor
             .create({
               assistantMessage: msg,
@@ -1223,6 +1239,7 @@ const layer = Layer.effect(
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
 
+            // 解析本轮可用的工具（含 plugin/permission/MCP 注入）
             const tools = yield* SessionTools.resolve({
               agent,
               session,
@@ -1240,6 +1257,7 @@ const layer = Layer.effect(
               Effect.provideService(RuntimeFlags.Service, flags),
             )
 
+            // json_schema 格式：注入结构化输出工具并强制 toolChoice
             if (lastUser.format?.type === "json_schema") {
               tools["StructuredOutput"] = createStructuredOutputTool({
                 schema: lastUser.format.schema,
@@ -1254,6 +1272,7 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
+            // 组装 system prompt：环境 + 全局指令 + MCP 指令 + skills
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
@@ -1269,6 +1288,8 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            // 单轮 LLM 调用（processor 内部走 llm.stream）；最后一步追加
+            // MAX_STEPS_PROMPT 提示模型收尾。返回 "compact" | "stop" | "continue"。
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1285,6 +1306,7 @@ const layer = Layer.effect(
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
 
+            // 结构化输出命中：写回 message 并结束循环
             if (structured !== undefined) {
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
@@ -1292,6 +1314,8 @@ const layer = Layer.effect(
               return "break" as const
             }
 
+            // 消息已 finish 且带错误时的三种特殊退路：content-filter 被供应商拦截、
+            // json_schema 未产出结构化结果，均转为显式错误消息并 break。
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
             if (finished && !handle.message.error) {
               // Surface any content-filter finish (e.g. Anthropic stop_reason:
@@ -1316,6 +1340,8 @@ const layer = Layer.effect(
               }
             }
 
+            // 决定下一轮：stop → 退出；compact → 创建压缩任务后 continue 先压缩；
+            // 其余（含 tool-calls 待续）→ continue 回传工具结果继续。
             if (result === "stop") return "break" as const
             if (result === "compact") {
               yield* compaction.create({
@@ -1335,6 +1361,7 @@ const layer = Layer.effect(
           continue
         }
 
+        // 结束循环后：后台清理过期压缩任务，返回最后一条 assistant 消息
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
@@ -1343,6 +1370,7 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
+      // 同一 session 同一时刻只允许一个活跃 run，由 run-state.ensureRunning 串行化
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
